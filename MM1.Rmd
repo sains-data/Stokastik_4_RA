@@ -1,0 +1,813 @@
+---
+title: "Tubes"
+author: "Natasya Ega Lina Marbun"
+date: "2025-11-18"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# TAHAP 1 — Import Data Excel ke R
+
+## 1. Baca file Excel dalam R
+
+```{r}
+install.packages("readxl")
+library(readxl)
+```
+
+```{r}
+library(readxl)
+
+# membaca data Excel
+data <- read_excel("C:/Users/HP/Downloads/dataset_training.xlsx")
+
+# menampilkan data
+data
+```
+
+# TAHAP 2 — Menstandarkan Kolom Waktu
+
+## 1. Ubah tanggal dari <chr> ke Date
+
+```{r}
+library(dplyr)
+library(lubridate)
+
+data <- data %>%
+  mutate(
+    tanggal = as.Date(tanggal)
+  )
+
+```
+
+```{r}
+str(data$`tanggal`)
+```
+
+## 2. Pastikan kolom datetime lain benar formatnya
+
+```{r}
+str(data %>% select(jadwal_mulai, jadwal_selesai, checkin_mhs, mulai_real, selesai_real))
+```
+
+## 3. Buat kolom waktu tambahan yang diperlukan untuk antrian
+
+```{r}
+data <- data %>%
+  mutate(
+    arrival_time = mulai_real,
+    service_time_min = durasi_real_menit
+  )
+
+head(data %>% select(ID, ruang, arrival_time, service_time_min))
+
+```
+
+```{r}
+head(data,10)
+```
+
+# LANGKAH 3 — Mengurutkan Data
+
+## 1. (per ruang + tanggal + arrival_time)
+
+```{r}
+library(dplyr)
+library(lubridate)
+
+data_sorted <- data %>%
+  arrange(ruang, tanggal, arrival_time)
+
+head(data_sorted, 10)
+```
+
+```{r}
+data_sorted %>%
+  filter(ruang == "F205") %>%
+  arrange(tanggal, arrival_time) %>%
+  select(ID, tanggal, ruang, arrival_time) %>%
+  head(15)
+```
+
+## 2. Menghitung Interarrival Time per Ruang per Hari
+
+```{r}
+library(dplyr)
+library(lubridate)
+
+data_inter <- data_sorted %>%
+  group_by(ruang, tanggal) %>%             # hitung per ruang dan per tanggal
+  arrange(arrival_time, .by_group = TRUE) %>%
+  mutate(
+    interarrival_min = as.numeric(
+      difftime(arrival_time, lag(arrival_time), units = "mins")
+    )
+  ) %>%
+  ungroup()
+```
+
+```{r}
+data_inter %>%
+  select(ID, ruang, tanggal, arrival_time, interarrival_min) %>%
+  head(100)
+```
+
+## 4. Menghitung λ (Laju Kedatangan) per Ruang per Hari
+
+```{r}
+lambda_per_ruang <- data_inter %>%
+  group_by(ruang, tanggal) %>%
+  summarise(
+    rata_interarrival = mean(interarrival_min, na.rm = TRUE),
+    lambda = 60 / rata_interarrival
+  )
+
+lambda_per_ruang
+```
+
+## 5. Menghitung μ (Laju Pelayanan)
+
+```{r}
+mu_per_ruang <- data_inter %>%
+  group_by(ruang, tanggal) %>%
+  summarise(
+    rata_service = mean(service_time_min, na.rm = TRUE),
+    mu = 60 / rata_service
+  )
+
+mu_per_ruang
+```
+
+# LANGKAH 4 - Menggabungkan λ & μ → Menghitung ρ (Utilization)
+
+## 1. Gabungkan tabel λ dan μ
+
+```{r}
+library(dplyr)
+
+antrian_ruang <- lambda_per_ruang %>%
+  left_join(mu_per_ruang, by = c("ruang", "tanggal")) %>%
+  mutate(
+    rho = lambda / mu
+  )
+
+antrian_ruang
+```
+
+# LANGKAH 5 — Menghitung Ukuran Kinerja Antrian M/M/1
+
+## 1. Filter ruang yang valid (ρ \< 1)
+
+```{r}
+valid_antrian <- antrian_ruang %>%
+  filter(!is.na(rho), rho < 1)
+
+head(valid_antrian, 16)
+```
+
+## 2. Hitung Lq, Ls, Wq, Ws
+
+```{r}
+mm1_metrics <- valid_antrian %>%
+  mutate(
+    Lq = (rho^2) / (1 - rho),
+    Ls = rho / (1 - rho),
+    Wq = Lq / lambda,
+    Ws = Ls / lambda
+  )
+
+mm1_metrics
+```
+
+```{r}
+mm1_metrics %>%
+  select(
+    ruang, tanggal,
+    lambda, mu, rho,
+    Lq, Ls, Wq, Ws
+  )
+
+```
+
+# TAHAP 6 - Visualisasi
+
+## 1. Tanggal 09/07/2024 Ruang F201
+
+```{r}
+library(dplyr)
+library(ggplot2)
+set.seed(123)
+
+# Define the M/M/1 simulation function
+simulate_mm1 <- function(lambda, mu, T = 10){
+  t <- 0
+  n <- 0
+  records <- tibble(time = 0, n = n, event = "start")
+  next_arrival <- rexp(1, rate = lambda)
+  next_departure <- Inf
+
+  while(t < T){
+    if(next_arrival <= next_departure){
+      t <- next_arrival
+      n <- n + 1
+      records <- add_row(records, time = t, n = n, event = "arrival")
+      next_arrival <- t + rexp(1, rate = lambda)
+      if(n == 1) next_departure <- t + rexp(1, rate = mu)
+    } else {
+      t <- next_departure
+      n <- max(0, n - 1)
+      records <- add_row(records, time = t, n = n, event = "departure")
+      if(n > 0) next_departure <- t + rexp(1, rate = mu) else next_departure <- Inf
+    }
+    if(t > T) break
+  }
+  # ensure final time T recorded for plotting
+  if(t < T) records <- add_row(records, time = T, n = records$n[nrow(records)], event = records$event[nrow(records)])
+
+  return(records)
+}
+
+# Extract lambda and mu from the first valid entry in mm1_metrics for simulation
+# Let's use the entry with the highest rho for a more interesting simulation, or just the first one
+# For demonstration, let's take the entry from F206 on 2024-08-05 as it has a high rho.
+sim_params <- mm1_metrics %>%
+  filter(ruang == "F201", tanggal == as.Date("2024-07-09")) %>%
+  ungroup() %>%
+  select(lambda, mu)
+
+lambda_sim <- sim_params$lambda[1]
+mu_sim <- sim_params$mu[1]
+T_sim <- 10 # Total simulation time in hours
+
+cat(sprintf("Simulating M/M/1 with lambda = %.2f (arrivals/hour), mu = %.2f (services/hour) for T = %d hours.\n", lambda_sim, mu_sim, T_sim))
+
+# Run the simulation
+sim_result <- simulate_mm1(lambda = lambda_sim, mu = mu_sim, T = T_sim)
+
+# Prepare data for plotting
+sim_plot_data <- sim_result %>%
+  arrange(time) %>%
+  mutate(next_time = lead(time, default = T_sim)) %>%
+  mutate(duration = next_time - time)
+
+# Create the step plot
+ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(linewidth = 1) +
+  geom_point(aes(col = event), size = 1.5) +
+  labs(
+    title = sprintf("Simulasi M/M/1: lambda=%.2f, mu=%.2f, T=%.1f jam", lambda_sim, mu_sim, T_sim),
+    x = "Waktu (jam)",
+    y = "Jumlah pelanggan di sistem (n)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+## 2. Tanggal 06/12/2024 Ruang F201
+
+```{r}
+sim_params <- mm1_metrics %>%
+  filter(ruang == "F201", tanggal == as.Date("2024-12-06")) %>%
+  ungroup() %>%
+  select(lambda, mu)
+
+lambda_sim <- sim_params$lambda[1]
+mu_sim <- sim_params$mu[1]
+T_sim <- 10 # Total simulation time in hours
+
+cat(sprintf("Simulating M/M/1 with lambda = %.2f (arrivals/hour), mu = %.2f (services/hour) for T = %d hours.\n", lambda_sim, mu_sim, T_sim))
+
+# Run the simulation
+sim_result <- simulate_mm1(lambda = lambda_sim, mu = mu_sim, T = T_sim)
+
+# Prepare data for plotting
+sim_plot_data <- sim_result %>%
+  arrange(time) %>%
+  mutate(next_time = lead(time, default = T_sim)) %>%
+  mutate(duration = next_time - time)
+
+# Create the step plot
+ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(linewidth = 1) +
+  geom_point(aes(col = event), size = 1.5) +
+  labs(
+    title = sprintf("Simulasi M/M/1: lambda=%.2f, mu=%.2f, T=%.1f jam", lambda_sim, mu_sim, T_sim),
+    x = "Waktu (jam)",
+    y = "Jumlah pelanggan di sistem (n)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+## 3. Tanggal 18/01/2024 Ruang F205
+
+```{r}
+sim_params <- mm1_metrics %>%
+  filter(ruang == "F205", tanggal == as.Date("2024-01-18")) %>%
+  ungroup() %>%
+  select(lambda, mu)
+
+lambda_sim <- sim_params$lambda[1]
+mu_sim <- sim_params$mu[1]
+T_sim <- 10 # Total simulation time in hours
+
+cat(sprintf("Simulating M/M/1 with lambda = %.2f (arrivals/hour), mu = %.2f (services/hour) for T = %d hours.\n", lambda_sim, mu_sim, T_sim))
+
+# Run the simulation
+sim_result <- simulate_mm1(lambda = lambda_sim, mu = mu_sim, T = T_sim)
+
+# Prepare data for plotting
+sim_plot_data <- sim_result %>%
+  arrange(time) %>%
+  mutate(next_time = lead(time, default = T_sim)) %>%
+  mutate(duration = next_time - time)
+
+# Create the step plot
+ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(linewidth = 1) +
+  geom_point(aes(col = event), size = 1.5) +
+  labs(
+    title = sprintf("Simulasi M/M/1: lambda=%.2f, mu=%.2f, T=%.1f jam", lambda_sim, mu_sim, T_sim),
+    x = "Waktu (jam)",
+    y = "Jumlah pelanggan di sistem (n)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## 4. Tanggal 01/11/2024 Ruang F205
+
+```{r}
+sim_params <- mm1_metrics %>%
+  filter(ruang == "F205", tanggal == as.Date("2024-11-01")) %>%
+  ungroup() %>%
+  select(lambda, mu)
+
+lambda_sim <- sim_params$lambda[1]
+mu_sim <- sim_params$mu[1]
+T_sim <- 10 # Total simulation time in hours
+
+cat(sprintf("Simulating M/M/1 with lambda = %.2f (arrivals/hour), mu = %.2f (services/hour) for T = %d hours.\n", lambda_sim, mu_sim, T_sim))
+
+# Run the simulation
+sim_result <- simulate_mm1(lambda = lambda_sim, mu = mu_sim, T = T_sim)
+
+# Prepare data for plotting
+sim_plot_data <- sim_result %>%
+  arrange(time) %>%
+  mutate(next_time = lead(time, default = T_sim)) %>%
+  mutate(duration = next_time - time)
+
+# Create the step plot
+ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(linewidth = 1) +
+  geom_point(aes(col = event), size = 1.5) +
+  labs(
+    title = sprintf("Simulasi M/M/1: lambda=%.2f, mu=%.2f, T=%.1f jam", lambda_sim, mu_sim, T_sim),
+    x = "Waktu (jam)",
+    y = "Jumlah pelanggan di sistem (n)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+## 5. Tanggal 11/12/2024 Ruang F205
+
+```{r}
+sim_params <- mm1_metrics %>%
+  filter(ruang == "F205", tanggal == as.Date("2024-12-11")) %>%
+  ungroup() %>%
+  select(lambda, mu)
+
+lambda_sim <- sim_params$lambda[1]
+mu_sim <- sim_params$mu[1]
+T_sim <- 10 # Total simulation time in hours
+
+cat(sprintf("Simulating M/M/1 with lambda = %.2f (arrivals/hour), mu = %.2f (services/hour) for T = %d hours.\n", lambda_sim, mu_sim, T_sim))
+
+# Run the simulation
+sim_result <- simulate_mm1(lambda = lambda_sim, mu = mu_sim, T = T_sim)
+
+# Prepare data for plotting
+sim_plot_data <- sim_result %>%
+  arrange(time) %>%
+  mutate(next_time = lead(time, default = T_sim)) %>%
+  mutate(duration = next_time - time)
+
+# Create the step plot
+ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(linewidth = 1) +
+  geom_point(aes(col = event), size = 1.5) +
+  labs(
+    title = sprintf("Simulasi M/M/1: lambda=%.2f, mu=%.2f, T=%.1f jam", lambda_sim, mu_sim, T_sim),
+    x = "Waktu (jam)",
+    y = "Jumlah pelanggan di sistem (n)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+## 6. Tanggal 05/08/2024 Ruang F206
+
+```{r}
+sim_params <- mm1_metrics %>%
+  filter(ruang == "F206", tanggal == as.Date("2024-08-05")) %>%
+  ungroup() %>%
+  select(lambda, mu)
+
+lambda_sim <- sim_params$lambda[1]
+mu_sim <- sim_params$mu[1]
+T_sim <- 10 # Total simulation time in hours
+
+cat(sprintf("Simulating M/M/1 with lambda = %.2f (arrivals/hour), mu = %.2f (services/hour) for T = %d hours.\n", lambda_sim, mu_sim, T_sim))
+
+# Run the simulation
+sim_result <- simulate_mm1(lambda = lambda_sim, mu = mu_sim, T = T_sim)
+
+# Prepare data for plotting
+sim_plot_data <- sim_result %>%
+  arrange(time) %>%
+  mutate(next_time = lead(time, default = T_sim)) %>%
+  mutate(duration = next_time - time)
+
+# Create the step plot
+ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(linewidth = 1) +
+  geom_point(aes(col = event), size = 1.5) +
+  labs(
+    title = sprintf("Simulasi M/M/1: lambda=%.2f, mu=%.2f, T=%.1f jam", lambda_sim, mu_sim, T_sim),
+    x = "Waktu (jam)",
+    y = "Jumlah pelanggan di sistem (n)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+## 7. Tanggal 20/12/2024 Ruang F206
+
+```{r}
+sim_params <- mm1_metrics %>%
+  filter(ruang == "F206", tanggal == as.Date("2024-12-20")) %>%
+  ungroup() %>%
+  select(lambda, mu)
+
+lambda_sim <- sim_params$lambda[1]
+mu_sim <- sim_params$mu[1]
+T_sim <- 10 # Total simulation time in hours
+
+cat(sprintf("Simulating M/M/1 with lambda = %.2f (arrivals/hour), mu = %.2f (services/hour) for T = %d hours.\n", lambda_sim, mu_sim, T_sim))
+
+# Run the simulation
+sim_result <- simulate_mm1(lambda = lambda_sim, mu = mu_sim, T = T_sim)
+
+# Prepare data for plotting
+sim_plot_data <- sim_result %>%
+  arrange(time) %>%
+  mutate(next_time = lead(time, default = T_sim)) %>%
+  mutate(duration = next_time - time)
+
+# Create the step plot
+ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(linewidth = 1) +
+  geom_point(aes(col = event), size = 1.5) +
+  labs(
+    title = sprintf("Simulasi M/M/1: lambda=%.2f, mu=%.2f, T=%.1f jam", lambda_sim, mu_sim, T_sim),
+    x = "Waktu (jam)",
+    y = "Jumlah pelanggan di sistem (n)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+## 8. Tanggal 19/08/2024 Ruang F207
+
+```{r}
+sim_params <- mm1_metrics %>%
+  filter(ruang == "F207", tanggal == as.Date("2024-08-19")) %>%
+  ungroup() %>%
+  select(lambda, mu)
+
+lambda_sim <- sim_params$lambda[1]
+mu_sim <- sim_params$mu[1]
+T_sim <- 10 # Total simulation time in hours
+
+cat(sprintf("Simulating M/M/1 with lambda = %.2f (arrivals/hour), mu = %.2f (services/hour) for T = %d hours.\n", lambda_sim, mu_sim, T_sim))
+
+# Run the simulation
+sim_result <- simulate_mm1(lambda = lambda_sim, mu = mu_sim, T = T_sim)
+
+# Prepare data for plotting
+sim_plot_data <- sim_result %>%
+  arrange(time) %>%
+  mutate(next_time = lead(time, default = T_sim)) %>%
+  mutate(duration = next_time - time)
+
+# Create the step plot
+ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(linewidth = 1) +
+  geom_point(aes(col = event), size = 1.5) +
+  labs(
+    title = sprintf("Simulasi M/M/1: lambda=%.2f, mu=%.2f, T=%.1f jam", lambda_sim, mu_sim, T_sim),
+    x = "Waktu (jam)",
+    y = "Jumlah pelanggan di sistem (n)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+## 9. Tanggal 19/01/2024 Ruang F209
+
+```{r}
+sim_params <- mm1_metrics %>%
+  filter(ruang == "F209", tanggal == as.Date("2024-01-19")) %>%
+  ungroup() %>%
+  select(lambda, mu)
+
+lambda_sim <- sim_params$lambda[1]
+mu_sim <- sim_params$mu[1]
+T_sim <- 10 # Total simulation time in hours
+
+cat(sprintf("Simulating M/M/1 with lambda = %.2f (arrivals/hour), mu = %.2f (services/hour) for T = %d hours.\n", lambda_sim, mu_sim, T_sim))
+
+# Run the simulation
+sim_result <- simulate_mm1(lambda = lambda_sim, mu = mu_sim, T = T_sim)
+
+# Prepare data for plotting
+sim_plot_data <- sim_result %>%
+  arrange(time) %>%
+  mutate(next_time = lead(time, default = T_sim)) %>%
+  mutate(duration = next_time - time)
+
+# Create the step plot
+ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(linewidth = 1) +
+  geom_point(aes(col = event), size = 1.5) +
+  labs(
+    title = sprintf("Simulasi M/M/1: lambda=%.2f, mu=%.2f, T=%.1f jam", lambda_sim, mu_sim, T_sim),
+    x = "Waktu (jam)",
+    y = "Jumlah pelanggan di sistem (n)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+## 10. Tanggal 06/08/2024 Ruang F209
+
+```{r}
+sim_params <- mm1_metrics %>%
+  filter(ruang == "F209", tanggal == as.Date("2024-08-06")) %>%
+  ungroup() %>%
+  select(lambda, mu)
+
+lambda_sim <- sim_params$lambda[1]
+mu_sim <- sim_params$mu[1]
+T_sim <- 10 # Total simulation time in hours
+
+cat(sprintf("Simulating M/M/1 with lambda = %.2f (arrivals/hour), mu = %.2f (services/hour) for T = %d hours.\n", lambda_sim, mu_sim, T_sim))
+
+# Run the simulation
+sim_result <- simulate_mm1(lambda = lambda_sim, mu = mu_sim, T = T_sim)
+
+# Prepare data for plotting
+sim_plot_data <- sim_result %>%
+  arrange(time) %>%
+  mutate(next_time = lead(time, default = T_sim)) %>%
+  mutate(duration = next_time - time)
+
+# Create the step plot
+ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(linewidth = 1) +
+  geom_point(aes(col = event), size = 1.5) +
+  labs(
+    title = sprintf("Simulasi M/M/1: lambda=%.2f, mu=%.2f, T=%.1f jam", lambda_sim, mu_sim, T_sim),
+    x = "Waktu (jam)",
+    y = "Jumlah pelanggan di sistem (n)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+## 11. Tanggal 18/01/2024 Ruang F210
+
+```{r}
+sim_params <- mm1_metrics %>%
+  filter(ruang == "F210", tanggal == as.Date("2024-01-18")) %>%
+  ungroup() %>%
+  select(lambda, mu)
+
+lambda_sim <- sim_params$lambda[1]
+mu_sim <- sim_params$mu[1]
+T_sim <- 10 # Total simulation time in hours
+
+cat(sprintf("Simulating M/M/1 with lambda = %.2f (arrivals/hour), mu = %.2f (services/hour) for T = %d hours.\n", lambda_sim, mu_sim, T_sim))
+
+# Run the simulation
+sim_result <- simulate_mm1(lambda = lambda_sim, mu = mu_sim, T = T_sim)
+
+# Prepare data for plotting
+sim_plot_data <- sim_result %>%
+  arrange(time) %>%
+  mutate(next_time = lead(time, default = T_sim)) %>%
+  mutate(duration = next_time - time)
+
+# Create the step plot
+ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(linewidth = 1) +
+  geom_point(aes(col = event), size = 1.5) +
+  labs(
+    title = sprintf("Simulasi M/M/1: lambda=%.2f, mu=%.2f, T=%.1f jam", lambda_sim, mu_sim, T_sim),
+    x = "Waktu (jam)",
+    y = "Jumlah pelanggan di sistem (n)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+## 12. Tanggal 23/08/2024 Ruang F213
+
+```{r}
+sim_params <- mm1_metrics %>%
+  filter(ruang == "F213", tanggal == as.Date("2024-08-23")) %>%
+  ungroup() %>%
+  select(lambda, mu)
+
+lambda_sim <- sim_params$lambda[1]
+mu_sim <- sim_params$mu[1]
+T_sim <- 10 # Total simulation time in hours
+
+cat(sprintf("Simulating M/M/1 with lambda = %.2f (arrivals/hour), mu = %.2f (services/hour) for T = %d hours.\n", lambda_sim, mu_sim, T_sim))
+
+# Run the simulation
+sim_result <- simulate_mm1(lambda = lambda_sim, mu = mu_sim, T = T_sim)
+
+# Prepare data for plotting
+sim_plot_data <- sim_result %>%
+  arrange(time) %>%
+  mutate(next_time = lead(time, default = T_sim)) %>%
+  mutate(duration = next_time - time)
+
+# Create the step plot
+ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(linewidth = 1) +
+  geom_point(aes(col = event), size = 1.5) +
+  labs(
+    title = sprintf("Simulasi M/M/1: lambda=%.2f, mu=%.2f, T=%.1f jam", lambda_sim, mu_sim, T_sim),
+    x = "Waktu (jam)",
+    y = "Jumlah pelanggan di sistem (n)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+## 13. Tanggal 23/08/2024 Ruang F213
+
+```{r}
+sim_params <- mm1_metrics %>%
+  filter(ruang == "F213", tanggal == as.Date("2024-08-23")) %>%
+  ungroup() %>%
+  select(lambda, mu)
+
+lambda_sim <- sim_params$lambda[1]
+mu_sim <- sim_params$mu[1]
+T_sim <- 10 # Total simulation time in hours
+
+cat(sprintf("Simulating M/M/1 with lambda = %.2f (arrivals/hour), mu = %.2f (services/hour) for T = %d hours.\n", lambda_sim, mu_sim, T_sim))
+
+# Run the simulation
+sim_result <- simulate_mm1(lambda = lambda_sim, mu = mu_sim, T = T_sim)
+
+# Prepare data for plotting
+sim_plot_data <- sim_result %>%
+  arrange(time) %>%
+  mutate(next_time = lead(time, default = T_sim)) %>%
+  mutate(duration = next_time - time)
+
+# Create the step plot
+ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(linewidth = 1) +
+  geom_point(aes(col = event), size = 1.5) +
+  labs(
+    title = sprintf("Simulasi M/M/1: lambda=%.2f, mu=%.2f, T=%.1f jam", lambda_sim, mu_sim, T_sim),
+    x = "Waktu (jam)",
+    y = "Jumlah pelanggan di sistem (n)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+## 14. Tanggal 23/08/2024 Ruang F213
+
+```{r}
+sim_params <- mm1_metrics %>%
+  filter(ruang == "F214", tanggal == as.Date("2024-08-30")) %>%
+  ungroup() %>%
+  select(lambda, mu)
+
+lambda_sim <- sim_params$lambda[1]
+mu_sim <- sim_params$mu[1]
+T_sim <- 10 # Total simulation time in hours
+
+cat(sprintf("Simulating M/M/1 with lambda = %.2f (arrivals/hour), mu = %.2f (services/hour) for T = %d hours.\n", lambda_sim, mu_sim, T_sim))
+
+# Run the simulation
+sim_result <- simulate_mm1(lambda = lambda_sim, mu = mu_sim, T = T_sim)
+
+# Prepare data for plotting
+sim_plot_data <- sim_result %>%
+  arrange(time) %>%
+  mutate(next_time = lead(time, default = T_sim)) %>%
+  mutate(duration = next_time - time)
+
+# Create the step plot
+ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(linewidth = 1) +
+  geom_point(aes(col = event), size = 1.5) +
+  labs(
+    title = sprintf("Simulasi M/M/1: lambda=%.2f, mu=%.2f, T=%.1f jam", lambda_sim, mu_sim, T_sim),
+    x = "Waktu (jam)",
+    y = "Jumlah pelanggan di sistem (n)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+## 15. Tanggal 08/08/2024 Ruang F214
+
+```{r}
+sim_params <- mm1_metrics %>%
+  filter(ruang == "F214", tanggal == as.Date("2024-09-06")) %>%
+  ungroup() %>%
+  select(lambda, mu)
+
+lambda_sim <- sim_params$lambda[1]
+mu_sim <- sim_params$mu[1]
+T_sim <- 10 # Total simulation time in hours
+
+cat(sprintf("Simulating M/M/1 with lambda = %.2f (arrivals/hour), mu = %.2f (services/hour) for T = %d hours.\n", lambda_sim, mu_sim, T_sim))
+
+# Run the simulation
+sim_result <- simulate_mm1(lambda = lambda_sim, mu = mu_sim, T = T_sim)
+
+# Prepare data for plotting
+sim_plot_data <- sim_result %>%
+  arrange(time) %>%
+  mutate(next_time = lead(time, default = T_sim)) %>%
+  mutate(duration = next_time - time)
+
+# Create the step plot
+ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(linewidth = 1) +
+  geom_point(aes(col = event), size = 1.5) +
+  labs(
+    title = sprintf("Simulasi M/M/1: lambda=%.2f, mu=%.2f, T=%.1f jam", lambda_sim, mu_sim, T_sim),
+    x = "Waktu (jam)",
+    y = "Jumlah pelanggan di sistem (n)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+## 16. Tanggal 12/12/2024 Ruang F214
+
+```{r}
+sim_params <- mm1_metrics %>%
+  filter(ruang == "F214", tanggal == as.Date("2024-12-12")) %>%
+  ungroup() %>%
+  select(lambda, mu)
+
+lambda_sim <- sim_params$lambda[1]
+mu_sim <- sim_params$mu[1]
+T_sim <- 10 # Total simulation time in hours
+
+cat(sprintf("Simulating M/M/1 with lambda = %.2f (arrivals/hour), mu = %.2f (services/hour) for T = %d hours.\n", lambda_sim, mu_sim, T_sim))
+
+# Run the simulation
+sim_result <- simulate_mm1(lambda = lambda_sim, mu = mu_sim, T = T_sim)
+
+# Prepare data for plotting
+sim_plot_data <- sim_result %>%
+  arrange(time) %>%
+  mutate(next_time = lead(time, default = T_sim)) %>%
+  mutate(duration = next_time - time)
+
+# Create the step plot
+ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(linewidth = 1) +
+  geom_point(aes(col = event), size = 1.5) +
+  labs(
+    title = sprintf("Simulasi M/M/1: lambda=%.2f, mu=%.2f, T=%.1f jam", lambda_sim, mu_sim, T_sim),
+    x = "Waktu (jam)",
+    y = "Jumlah pelanggan di sistem (n)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```

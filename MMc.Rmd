@@ -1,0 +1,1307 @@
+---
+title: 'y'
+author: "Natasya Ega Lina Marbun"
+date: "2025-11-18"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# TAHAP 1: Persiapan dan Import Data
+
+```{r}
+# Load library
+library(readxl)
+library(tidyverse)
+library(lubridate)
+library(knitr)
+```
+
+```{r}
+# --- PENTING: Sesuaikan path file di bawah ini ---
+# Pastikan file Excel berada di folder yang sama dengan file .Rmd ini
+file_path <- "C:/Users/HP/Downloads/y.xlsx" 
+
+# Membaca data
+if(file.exists(file_path)) {
+  data <- read_excel(file_path)
+  print("Data berhasil dimuat.")
+} else {
+  stop("File tidak ditemukan! Periksa kembali path file Anda.")
+}
+```
+
+```{r}
+# Konversi kolom tanggal pastikan format Date
+data <- data %>%
+  mutate(tanggal = as.Date(tanggal))
+
+# Tampilkan sampel data
+glimpse(data)
+```
+
+# TAHAP 2: Perhitungan Parameter Antrian (\$\\lambda, \\mu, c\$)
+
+```{r}
+# 1. Menghitung Lambda (Kedatangan per hari)
+lambda_per_hari <- data %>%
+  group_by(tanggal) %>%
+  summarise(lambda = n()) %>% # Asumsi: 1 baris = 1 kedatangan
+  ungroup()
+```
+
+```{r}
+# 2. Menghitung Mu (Rata-rata pelayanan per hari) & C (Jumlah Ruang Unik)
+# Kita ambil rata-rata durasi slot jika berbeda-beda, lalu konversi ke rate per hari (atau per jam kerja)
+# Di sini kita asumsikan unit waktu adalah JAM agar angka tidak terlalu besar/kecil
+# Jika durasi_slot_menit adalah durasi pelayanan:
+
+param_per_hari <- data %>%
+  group_by(tanggal) %>%
+  summarise(
+    # Menghitung jumlah server (c) = jumlah ruang unik yang terpakai hari itu
+    c = n_distinct(ruang),
+    
+    # Rata-rata durasi pelayanan dalam menit
+    avg_durasi_menit = mean(durasi_slot_menit, na.rm = TRUE)
+  ) %>%
+  mutate(
+    # Konversi Mu ke satuan per JAM (60 / menit)
+    # Jika unit waktu analisis ingin per HARI kerja (misal 8 jam), kalikan 8. 
+    # Di sini kita pakai per JAM.
+    mu_per_jam = 60 / avg_durasi_menit
+  ) %>%
+  ungroup()
+
+lambda_per_hari
+```
+
+```{r}
+# 3. Gabungkan Lambda, Mu, dan C
+mmc_data <- left_join(lambda_per_hari, param_per_hari, by = "tanggal") %>%
+  mutate(
+    # Sesuaikan lambda juga ke satuan per JAM
+    # Asumsi jam operasional kampus misal 8 jam (08.00 - 16.00)
+    lambda_per_jam = lambda / 8 
+  )
+
+kable(head(mmc_data, 10), caption = "Parameter Antrian per Tanggal (Satuan Jam)")
+```
+
+```{r}
+mmc_data
+```
+
+# TAHAP 3: Perhitungan Kinerja M/M/c
+
+```{r}
+# --- Fungsi Helper untuk Menghitung P0 (Erlang-C) ---
+calculate_p0 <- function(c, rho) {
+  if (rho >= 1) return(0) # Sistem tidak stabil
+  
+  # Summation term (n = 0 to c-1)
+  term1 <- sum(sapply(0:(c-1), function(n) {
+    ((c * rho)^n) / factorial(n)
+  }))
+  
+  # Second term
+  term2 <- ((c * rho)^c) / (factorial(c) * (1 - rho))
+  
+  return(1 / (term1 + term2))
+}
+
+```
+
+```{r}
+# --- Hitung Metrik ---
+hasil_analisis <- mmc_data %>%
+  rowwise() %>% # Proses baris per baris untuk fungsi kompleks
+  mutate(
+    # Hitung Utilitas (Rho)
+    rho = lambda_per_jam / (c * mu_per_jam),
+    
+    # Hitung P0
+    P0 = calculate_p0(c, rho),
+    
+    # Hitung Lq (Rata-rata antrian)
+    Lq = if(rho < 1) {
+      (P0 * ((c * rho)^c) * rho) / (factorial(c) * (1 - rho)^2)
+    } else { Inf }, # Inf jika sistem overload
+    
+    # Hitung Wq (Waktu tunggu di antrian dalam JAM)
+    Wq = if(rho < 1) { Lq / lambda_per_jam } else { Inf },
+    
+    # Hitung Ws (Waktu total dalam sistem: antri + dilayani)
+    Ws = if(rho < 1) { Wq + (1 / mu_per_jam) } else { Inf },
+    
+    # Hitung Ls (Rata-rata orang dalam sistem)
+    Ls = if(rho < 1) { lambda_per_jam * Ws } else { Inf },
+    
+    # Konversi Wq ke Menit agar mudah dibaca
+    Wq_menit = Wq * 60
+  ) %>%
+  ungroup()
+```
+
+```{r}
+# Tampilkan Data yang Valid (Tidak Overload)
+valid_data <- hasil_analisis %>% filter(rho < 1)
+
+kable(head(valid_data %>% select(tanggal, c, rho, Lq, Wq_menit, Wq, Ws, Ls, P0), 100), 
+      caption = "Hasil Perhitungan M/M/c")
+```
+
+# TAHAP 4: Visualisasi Kinerja
+
+```{r}
+# Plot 1: Utilisasi Ruang
+p1 <- ggplot(hasil_analisis, aes(x = tanggal, y = rho)) +
+  geom_line(color = "#2c3e50", size = 1) +
+  geom_point(aes(color = rho >= 1), size = 2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "green"), name = "Overload?") +
+  labs(title = "Tingkat Kesibukan Ruang (Utilisasi) per Tanggal",
+       subtitle = "Jika di atas garis merah, sistem overload (antrian meledak)",
+       y = "Utilisasi (rho)") +
+  theme_minimal()
+
+print(p1)
+```
+
+```{r}
+# Plot 2: Waktu Tunggu (hanya untuk data stabil)
+p2 <- ggplot(valid_data, aes(x = tanggal, y = Wq_menit)) +
+  geom_col(fill = "#3498db") +
+  labs(title = "Rata-rata Waktu Tunggu Antrian (Wq)",
+       subtitle = "Hanya menampilkan tanggal dimana sistem stabil",
+       y = "Waktu Tunggu (Menit)") +
+  theme_minimal()
+
+print(p2)
+```
+
+# TAHAP 5: Simulasi Kejadian Diskrit (M/M/c)
+
+```{r}
+# --- Definisi Fungsi Simulasi M/M/c ---
+simulate_mmc <- function(lambda, mu, c, T = 10) {
+  # Inisialisasi
+  t <- 0
+  n <- 0 # Jumlah orang dalam sistem saat ini
+  records <- tibble(time = 0, n = 0, event = "start")
+  
+  while(t < T) {
+    # Laju kepergian (Departure rate) bergantung pada jumlah orang (n)
+    # Jika n < c, rate = n * mu. Jika n >= c, rate = c * mu (semua server sibuk)
+    current_mu_rate <- min(n, c) * mu
+    
+    # Total rate kejadian
+    total_rate <- lambda + current_mu_rate
+    
+    # Generate waktu kejadian berikutnya (Exponential)
+    dt <- rexp(1, rate = total_rate)
+    t <- t + dt
+    
+    if (t > T) break
+    
+    # Tentukan jenis kejadian: Arrival atau Departure?
+    is_arrival <- runif(1) < (lambda / total_rate)
+    
+    if (is_arrival) {
+      n <- n + 1
+      event_type <- "arrival"
+    } else {
+      if (n > 0) {
+        n <- n - 1
+        event_type <- "departure"
+      } else {
+        next # Skip jika sistem kosong tapi terpilih departure (seharusnya rare)
+      }
+    }
+    
+    records <- add_row(records, time = t, n = n, event = event_type)
+  }
+  # Penutup grafik
+  records <- add_row(records, time = T, n = tail(records$n, 1), event = "end")
+  return(records)
+}
+```
+
+## Simulasi tanggal 06-12-2024
+
+```{r}
+### Menjalankan Simulasi
+# 1. Pilih Tanggal Sampel
+sample_case <- valid_data %>%
+  filter(tanggal == "2024-12-06")
+
+target_tgl <- sample_case$tanggal
+lam_sim <- sample_case$lambda_per_jam
+mu_sim <- sample_case$mu_per_jam
+c_sim <- sample_case$c
+
+# 2. Jalankan Simulasi (Durasi T = 10 jam)
+set.seed(123) # Agar hasil reproducible
+sim_result <- simulate_mmc(lambda = lam_sim, mu = mu_sim, c = c_sim, T = 10)
+```
+
+```{r}
+# 3. Visualisasi Step Plot
+ggplot(sim_result, aes(x = time, y = n)) +
+  geom_step(direction = "hv", color = "navy", linewidth = 0.8) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = 0.5, y = c_sim + 0.2, 
+           label = paste("Kapasitas Server (c) =", c_sim), color = "red", hjust = 0) +
+  labs(
+    title = paste("Simulasi Dinamika Antrian Tanggal:", target_tgl),
+    subtitle = sprintf("Parameter: λ=%.2f/jam, μ=%.2f/jam, Server=%d", lam_sim, mu_sim, c_sim),
+    x = "Waktu Simulasi (Jam)",
+    y = "Jumlah Mahasiswa di Sistem (n)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r}
+# --- VISUALISASI: Sistem vs Server Sibuk ---
+library(gridExtra) 
+
+# 1. Siapkan Data
+# Kita perlu menambahkan kolom 'busy' ke hasil simulasi
+# Logika: Jumlah server sibuk tidak bisa melebihi kapasitas server (c_sim)
+sim_plot_data <- sim_result %>%
+  mutate(busy = pmin(n, c_sim)) # pmin membandingkan n dengan c_sim, ambil yang terkecil
+
+# 2. Buat Plot 1: Jumlah Pelanggan di Sistem (n)
+p1 <- ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(color = "#2980b9", linewidth = 1) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red") +
+  annotate("text", x = 0.5, y = c_sim + 0.2, label = "Kapasitas (c)", color = "red", size = 3) +
+  labs(
+    title = paste("Dinamika Sistem Antrian - Tanggal:", target_tgl),
+    subtitle = "Total Pelanggan dalam Sistem (Menunggu + Dilayani)",
+    y = "Jumlah (n)",
+    x = NULL # Hilangkan label x di plot atas agar tidak duplikat
+  ) +
+  theme_minimal()
+
+# 3. Buat Plot 2: Jumlah Server Sibuk (busy)
+p2 <- ggplot(sim_plot_data, aes(x = time, y = busy)) +
+  geom_step(color = "#27ae60", linewidth = 1) +
+  # Set batas Y agar terlihat jelas batas maksimalnya
+  coord_cartesian(ylim = c(0, c_sim + 0.5)) + 
+  labs(
+    title = "Status Server (Sibuk)",
+    subtitle = paste("Maksimal server sibuk =", c_sim),
+    y = "Server Sibuk",
+    x = "Waktu Simulasi (Jam)"
+  ) +
+  theme_minimal()
+
+# 4. Gabungkan Plot Atas dan Bawah
+grid.arrange(p1, p2, nrow = 2, heights = c(1, 1))
+
+```
+
+## Tanggal 07-12-2024
+
+```{r}
+### Menjalankan Simulasi
+# 1. Pilih Tanggal Sampel
+sample_case <- valid_data %>%
+  filter(tanggal == "2024-12-07")
+
+target_tgl <- sample_case$tanggal
+lam_sim <- sample_case$lambda_per_jam
+mu_sim <- sample_case$mu_per_jam
+c_sim <- sample_case$c
+
+# 2. Jalankan Simulasi (Durasi T = 10 jam)
+set.seed(123) # Agar hasil reproducible
+sim_result <- simulate_mmc(lambda = lam_sim, mu = mu_sim, c = c_sim, T = 10)
+
+# 3. Visualisasi Step Plot
+ggplot(sim_result, aes(x = time, y = n)) +
+  geom_step(direction = "hv", color = "navy", linewidth = 0.8) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = 0.5, y = c_sim + 0.2, 
+           label = paste("Kapasitas Server (c) =", c_sim), color = "red", hjust = 0) +
+  labs(
+    title = paste("Simulasi Dinamika Antrian Tanggal:", target_tgl),
+    subtitle = sprintf("Parameter: λ=%.2f/jam, μ=%.2f/jam, Server=%d", lam_sim, mu_sim, c_sim),
+    x = "Waktu Simulasi (Jam)",
+    y = "Jumlah Mahasiswa di Sistem (n)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# --- VISUALISASI: Sistem vs Server Sibuk ---
+library(gridExtra) 
+
+# 1. Siapkan Data
+# Kita perlu menambahkan kolom 'busy' ke hasil simulasi
+# Logika: Jumlah server sibuk tidak bisa melebihi kapasitas server (c_sim)
+sim_plot_data <- sim_result %>%
+  mutate(busy = pmin(n, c_sim)) # pmin membandingkan n dengan c_sim, ambil yang terkecil
+
+# 2. Buat Plot 1: Jumlah Pelanggan di Sistem (n)
+p1 <- ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(color = "#2980b9", linewidth = 1) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red") +
+  annotate("text", x = 0.5, y = c_sim + 0.2, label = "Kapasitas (c)", color = "red", size = 3) +
+  labs(
+    title = paste("Dinamika Sistem Antrian - Tanggal:", target_tgl),
+    subtitle = "Total Pelanggan dalam Sistem (Menunggu + Dilayani)",
+    y = "Jumlah (n)",
+    x = NULL # Hilangkan label x di plot atas agar tidak duplikat
+  ) +
+  theme_minimal()
+
+# 3. Buat Plot 2: Jumlah Server Sibuk (busy)
+p2 <- ggplot(sim_plot_data, aes(x = time, y = busy)) +
+  geom_step(color = "#27ae60", linewidth = 1) +
+  # Set batas Y agar terlihat jelas batas maksimalnya
+  coord_cartesian(ylim = c(0, c_sim + 0.5)) + 
+  labs(
+    title = "Status Server (Sibuk)",
+    subtitle = paste("Maksimal server sibuk =", c_sim),
+    y = "Server Sibuk",
+    x = "Waktu Simulasi (Jam)"
+  ) +
+  theme_minimal()
+
+# 4. Gabungkan Plot Atas dan Bawah
+grid.arrange(p1, p2, nrow = 2, heights = c(1, 1))
+
+```
+
+## Tanggal 08-12-2024
+
+```{r}
+### Menjalankan Simulasi
+# 1. Pilih Tanggal Sampel
+sample_case <- valid_data %>%
+  filter(tanggal == "2024-12-08")
+
+target_tgl <- sample_case$tanggal
+lam_sim <- sample_case$lambda_per_jam
+mu_sim <- sample_case$mu_per_jam
+c_sim <- sample_case$c
+
+# 2. Jalankan Simulasi (Durasi T = 10 jam)
+set.seed(123) # Agar hasil reproducible
+sim_result <- simulate_mmc(lambda = lam_sim, mu = mu_sim, c = c_sim, T = 10)
+
+# 3. Visualisasi Step Plot
+ggplot(sim_result, aes(x = time, y = n)) +
+  geom_step(direction = "hv", color = "navy", linewidth = 0.8) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = 0.5, y = c_sim + 0.2, 
+           label = paste("Kapasitas Server (c) =", c_sim), color = "red", hjust = 0) +
+  labs(
+    title = paste("Simulasi Dinamika Antrian Tanggal:", target_tgl),
+    subtitle = sprintf("Parameter: λ=%.2f/jam, μ=%.2f/jam, Server=%d", lam_sim, mu_sim, c_sim),
+    x = "Waktu Simulasi (Jam)",
+    y = "Jumlah Mahasiswa di Sistem (n)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# --- VISUALISASI: Sistem vs Server Sibuk ---
+library(gridExtra) 
+
+# 1. Siapkan Data
+# Kita perlu menambahkan kolom 'busy' ke hasil simulasi
+# Logika: Jumlah server sibuk tidak bisa melebihi kapasitas server (c_sim)
+sim_plot_data <- sim_result %>%
+  mutate(busy = pmin(n, c_sim)) # pmin membandingkan n dengan c_sim, ambil yang terkecil
+
+# 2. Buat Plot 1: Jumlah Pelanggan di Sistem (n)
+p1 <- ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(color = "#2980b9", linewidth = 1) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red") +
+  annotate("text", x = 0.5, y = c_sim + 0.2, label = "Kapasitas (c)", color = "red", size = 3) +
+  labs(
+    title = paste("Dinamika Sistem Antrian - Tanggal:", target_tgl),
+    subtitle = "Total Pelanggan dalam Sistem (Menunggu + Dilayani)",
+    y = "Jumlah (n)",
+    x = NULL # Hilangkan label x di plot atas agar tidak duplikat
+  ) +
+  theme_minimal()
+
+# 3. Buat Plot 2: Jumlah Server Sibuk (busy)
+p2 <- ggplot(sim_plot_data, aes(x = time, y = busy)) +
+  geom_step(color = "#27ae60", linewidth = 1) +
+  # Set batas Y agar terlihat jelas batas maksimalnya
+  coord_cartesian(ylim = c(0, c_sim + 0.5)) + 
+  labs(
+    title = "Status Server (Sibuk)",
+    subtitle = paste("Maksimal server sibuk =", c_sim),
+    y = "Server Sibuk",
+    x = "Waktu Simulasi (Jam)"
+  ) +
+  theme_minimal()
+
+# 4. Gabungkan Plot Atas dan Bawah
+grid.arrange(p1, p2, nrow = 2, heights = c(1, 1))
+```
+
+## Tanggal 09-12-2024
+
+```{r}
+### Menjalankan Simulasi
+# 1. Pilih Tanggal Sampel
+sample_case <- valid_data %>%
+  filter(tanggal == "2024-12-09")
+
+target_tgl <- sample_case$tanggal
+lam_sim <- sample_case$lambda_per_jam
+mu_sim <- sample_case$mu_per_jam
+c_sim <- sample_case$c
+
+# 2. Jalankan Simulasi (Durasi T = 10 jam)
+set.seed(123) # Agar hasil reproducible
+sim_result <- simulate_mmc(lambda = lam_sim, mu = mu_sim, c = c_sim, T = 10)
+
+# 3. Visualisasi Step Plot
+ggplot(sim_result, aes(x = time, y = n)) +
+  geom_step(direction = "hv", color = "navy", linewidth = 0.8) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = 0.5, y = c_sim + 0.2, 
+           label = paste("Kapasitas Server (c) =", c_sim), color = "red", hjust = 0) +
+  labs(
+    title = paste("Simulasi Dinamika Antrian Tanggal:", target_tgl),
+    subtitle = sprintf("Parameter: λ=%.2f/jam, μ=%.2f/jam, Server=%d", lam_sim, mu_sim, c_sim),
+    x = "Waktu Simulasi (Jam)",
+    y = "Jumlah Mahasiswa di Sistem (n)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# --- VISUALISASI: Sistem vs Server Sibuk ---
+library(gridExtra) 
+
+# 1. Siapkan Data
+# Kita perlu menambahkan kolom 'busy' ke hasil simulasi
+# Logika: Jumlah server sibuk tidak bisa melebihi kapasitas server (c_sim)
+sim_plot_data <- sim_result %>%
+  mutate(busy = pmin(n, c_sim)) # pmin membandingkan n dengan c_sim, ambil yang terkecil
+
+# 2. Buat Plot 1: Jumlah Pelanggan di Sistem (n)
+p1 <- ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(color = "#2980b9", linewidth = 1) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red") +
+  annotate("text", x = 0.5, y = c_sim + 0.2, label = "Kapasitas (c)", color = "red", size = 3) +
+  labs(
+    title = paste("Dinamika Sistem Antrian - Tanggal:", target_tgl),
+    subtitle = "Total Pelanggan dalam Sistem (Menunggu + Dilayani)",
+    y = "Jumlah (n)",
+    x = NULL # Hilangkan label x di plot atas agar tidak duplikat
+  ) +
+  theme_minimal()
+
+# 3. Buat Plot 2: Jumlah Server Sibuk (busy)
+p2 <- ggplot(sim_plot_data, aes(x = time, y = busy)) +
+  geom_step(color = "#27ae60", linewidth = 1) +
+  # Set batas Y agar terlihat jelas batas maksimalnya
+  coord_cartesian(ylim = c(0, c_sim + 0.5)) + 
+  labs(
+    title = "Status Server (Sibuk)",
+    subtitle = paste("Maksimal server sibuk =", c_sim),
+    y = "Server Sibuk",
+    x = "Waktu Simulasi (Jam)"
+  ) +
+  theme_minimal()
+
+# 4. Gabungkan Plot Atas dan Bawah
+grid.arrange(p1, p2, nrow = 2, heights = c(1, 1))
+```
+
+## Tanggal 10-12-2024
+
+```{r}
+### Menjalankan Simulasi
+# 1. Pilih Tanggal Sampel
+sample_case <- valid_data %>%
+  filter(tanggal == "2024-12-10")
+
+target_tgl <- sample_case$tanggal
+lam_sim <- sample_case$lambda_per_jam
+mu_sim <- sample_case$mu_per_jam
+c_sim <- sample_case$c
+
+# 2. Jalankan Simulasi (Durasi T = 10 jam)
+set.seed(123) # Agar hasil reproducible
+sim_result <- simulate_mmc(lambda = lam_sim, mu = mu_sim, c = c_sim, T = 10)
+
+# 3. Visualisasi Step Plot
+ggplot(sim_result, aes(x = time, y = n)) +
+  geom_step(direction = "hv", color = "navy", linewidth = 0.8) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = 0.5, y = c_sim + 0.2, 
+           label = paste("Kapasitas Server (c) =", c_sim), color = "red", hjust = 0) +
+  labs(
+    title = paste("Simulasi Dinamika Antrian Tanggal:", target_tgl),
+    subtitle = sprintf("Parameter: λ=%.2f/jam, μ=%.2f/jam, Server=%d", lam_sim, mu_sim, c_sim),
+    x = "Waktu Simulasi (Jam)",
+    y = "Jumlah Mahasiswa di Sistem (n)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# --- VISUALISASI: Sistem vs Server Sibuk ---
+library(gridExtra) 
+
+# 1. Siapkan Data
+# Kita perlu menambahkan kolom 'busy' ke hasil simulasi
+# Logika: Jumlah server sibuk tidak bisa melebihi kapasitas server (c_sim)
+sim_plot_data <- sim_result %>%
+  mutate(busy = pmin(n, c_sim)) # pmin membandingkan n dengan c_sim, ambil yang terkecil
+
+# 2. Buat Plot 1: Jumlah Pelanggan di Sistem (n)
+p1 <- ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(color = "#2980b9", linewidth = 1) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red") +
+  annotate("text", x = 0.5, y = c_sim + 0.2, label = "Kapasitas (c)", color = "red", size = 3) +
+  labs(
+    title = paste("Dinamika Sistem Antrian - Tanggal:", target_tgl),
+    subtitle = "Total Pelanggan dalam Sistem (Menunggu + Dilayani)",
+    y = "Jumlah (n)",
+    x = NULL # Hilangkan label x di plot atas agar tidak duplikat
+  ) +
+  theme_minimal()
+
+# 3. Buat Plot 2: Jumlah Server Sibuk (busy)
+p2 <- ggplot(sim_plot_data, aes(x = time, y = busy)) +
+  geom_step(color = "#27ae60", linewidth = 1) +
+  # Set batas Y agar terlihat jelas batas maksimalnya
+  coord_cartesian(ylim = c(0, c_sim + 0.5)) + 
+  labs(
+    title = "Status Server (Sibuk)",
+    subtitle = paste("Maksimal server sibuk =", c_sim),
+    y = "Server Sibuk",
+    x = "Waktu Simulasi (Jam)"
+  ) +
+  theme_minimal()
+
+# 4. Gabungkan Plot Atas dan Bawah
+grid.arrange(p1, p2, nrow = 2, heights = c(1, 1))
+```
+
+## Tanggal 11-12-2024
+
+```{r}
+### Menjalankan Simulasi
+# 1. Pilih Tanggal Sampel
+sample_case <- valid_data %>%
+  filter(tanggal == "2024-12-11")
+
+target_tgl <- sample_case$tanggal
+lam_sim <- sample_case$lambda_per_jam
+mu_sim <- sample_case$mu_per_jam
+c_sim <- sample_case$c
+
+# 2. Jalankan Simulasi (Durasi T = 10 jam)
+set.seed(123) # Agar hasil reproducible
+sim_result <- simulate_mmc(lambda = lam_sim, mu = mu_sim, c = c_sim, T = 10)
+
+# 3. Visualisasi Step Plot
+ggplot(sim_result, aes(x = time, y = n)) +
+  geom_step(direction = "hv", color = "navy", linewidth = 0.8) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = 0.5, y = c_sim + 0.2, 
+           label = paste("Kapasitas Server (c) =", c_sim), color = "red", hjust = 0) +
+  labs(
+    title = paste("Simulasi Dinamika Antrian Tanggal:", target_tgl),
+    subtitle = sprintf("Parameter: λ=%.2f/jam, μ=%.2f/jam, Server=%d", lam_sim, mu_sim, c_sim),
+    x = "Waktu Simulasi (Jam)",
+    y = "Jumlah Mahasiswa di Sistem (n)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# --- VISUALISASI: Sistem vs Server Sibuk ---
+library(gridExtra) 
+
+# 1. Siapkan Data
+# Kita perlu menambahkan kolom 'busy' ke hasil simulasi
+# Logika: Jumlah server sibuk tidak bisa melebihi kapasitas server (c_sim)
+sim_plot_data <- sim_result %>%
+  mutate(busy = pmin(n, c_sim)) # pmin membandingkan n dengan c_sim, ambil yang terkecil
+
+# 2. Buat Plot 1: Jumlah Pelanggan di Sistem (n)
+p1 <- ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(color = "#2980b9", linewidth = 1) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red") +
+  annotate("text", x = 0.5, y = c_sim + 0.2, label = "Kapasitas (c)", color = "red", size = 3) +
+  labs(
+    title = paste("Dinamika Sistem Antrian - Tanggal:", target_tgl),
+    subtitle = "Total Pelanggan dalam Sistem (Menunggu + Dilayani)",
+    y = "Jumlah (n)",
+    x = NULL # Hilangkan label x di plot atas agar tidak duplikat
+  ) +
+  theme_minimal()
+
+# 3. Buat Plot 2: Jumlah Server Sibuk (busy)
+p2 <- ggplot(sim_plot_data, aes(x = time, y = busy)) +
+  geom_step(color = "#27ae60", linewidth = 1) +
+  # Set batas Y agar terlihat jelas batas maksimalnya
+  coord_cartesian(ylim = c(0, c_sim + 0.5)) + 
+  labs(
+    title = "Status Server (Sibuk)",
+    subtitle = paste("Maksimal server sibuk =", c_sim),
+    y = "Server Sibuk",
+    x = "Waktu Simulasi (Jam)"
+  ) +
+  theme_minimal()
+
+# 4. Gabungkan Plot Atas dan Bawah
+grid.arrange(p1, p2, nrow = 2, heights = c(1, 1))
+```
+
+## Tanggal 12-12-2024
+
+```{r}
+### Menjalankan Simulasi
+# 1. Pilih Tanggal Sampel
+sample_case <- valid_data %>%
+  filter(tanggal == "2024-12-12")
+
+target_tgl <- sample_case$tanggal
+lam_sim <- sample_case$lambda_per_jam
+mu_sim <- sample_case$mu_per_jam
+c_sim <- sample_case$c
+
+# 2. Jalankan Simulasi (Durasi T = 10 jam)
+set.seed(123) # Agar hasil reproducible
+sim_result <- simulate_mmc(lambda = lam_sim, mu = mu_sim, c = c_sim, T = 10)
+
+# 3. Visualisasi Step Plot
+ggplot(sim_result, aes(x = time, y = n)) +
+  geom_step(direction = "hv", color = "navy", linewidth = 0.8) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = 0.5, y = c_sim + 0.2, 
+           label = paste("Kapasitas Server (c) =", c_sim), color = "red", hjust = 0) +
+  labs(
+    title = paste("Simulasi Dinamika Antrian Tanggal:", target_tgl),
+    subtitle = sprintf("Parameter: λ=%.2f/jam, μ=%.2f/jam, Server=%d", lam_sim, mu_sim, c_sim),
+    x = "Waktu Simulasi (Jam)",
+    y = "Jumlah Mahasiswa di Sistem (n)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# --- VISUALISASI: Sistem vs Server Sibuk ---
+library(gridExtra) 
+
+# 1. Siapkan Data
+# Kita perlu menambahkan kolom 'busy' ke hasil simulasi
+# Logika: Jumlah server sibuk tidak bisa melebihi kapasitas server (c_sim)
+sim_plot_data <- sim_result %>%
+  mutate(busy = pmin(n, c_sim)) # pmin membandingkan n dengan c_sim, ambil yang terkecil
+
+# 2. Buat Plot 1: Jumlah Pelanggan di Sistem (n)
+p1 <- ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(color = "#2980b9", linewidth = 1) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red") +
+  annotate("text", x = 0.5, y = c_sim + 0.2, label = "Kapasitas (c)", color = "red", size = 3) +
+  labs(
+    title = paste("Dinamika Sistem Antrian - Tanggal:", target_tgl),
+    subtitle = "Total Pelanggan dalam Sistem (Menunggu + Dilayani)",
+    y = "Jumlah (n)",
+    x = NULL # Hilangkan label x di plot atas agar tidak duplikat
+  ) +
+  theme_minimal()
+
+# 3. Buat Plot 2: Jumlah Server Sibuk (busy)
+p2 <- ggplot(sim_plot_data, aes(x = time, y = busy)) +
+  geom_step(color = "#27ae60", linewidth = 1) +
+  # Set batas Y agar terlihat jelas batas maksimalnya
+  coord_cartesian(ylim = c(0, c_sim + 0.5)) + 
+  labs(
+    title = "Status Server (Sibuk)",
+    subtitle = paste("Maksimal server sibuk =", c_sim),
+    y = "Server Sibuk",
+    x = "Waktu Simulasi (Jam)"
+  ) +
+  theme_minimal()
+
+# 4. Gabungkan Plot Atas dan Bawah
+grid.arrange(p1, p2, nrow = 2, heights = c(1, 1))
+```
+
+## Tanggal 13-12-2024
+
+```{r}
+### Menjalankan Simulasi
+# 1. Pilih Tanggal Sampel
+sample_case <- valid_data %>%
+  filter(tanggal == "2024-12-13")
+
+target_tgl <- sample_case$tanggal
+lam_sim <- sample_case$lambda_per_jam
+mu_sim <- sample_case$mu_per_jam
+c_sim <- sample_case$c
+
+# 2. Jalankan Simulasi (Durasi T = 10 jam)
+set.seed(123) # Agar hasil reproducible
+sim_result <- simulate_mmc(lambda = lam_sim, mu = mu_sim, c = c_sim, T = 10)
+
+# 3. Visualisasi Step Plot
+ggplot(sim_result, aes(x = time, y = n)) +
+  geom_step(direction = "hv", color = "navy", linewidth = 0.8) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = 0.5, y = c_sim + 0.2, 
+           label = paste("Kapasitas Server (c) =", c_sim), color = "red", hjust = 0) +
+  labs(
+    title = paste("Simulasi Dinamika Antrian Tanggal:", target_tgl),
+    subtitle = sprintf("Parameter: λ=%.2f/jam, μ=%.2f/jam, Server=%d", lam_sim, mu_sim, c_sim),
+    x = "Waktu Simulasi (Jam)",
+    y = "Jumlah Mahasiswa di Sistem (n)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# --- VISUALISASI: Sistem vs Server Sibuk ---
+library(gridExtra) 
+
+# 1. Siapkan Data
+# Kita perlu menambahkan kolom 'busy' ke hasil simulasi
+# Logika: Jumlah server sibuk tidak bisa melebihi kapasitas server (c_sim)
+sim_plot_data <- sim_result %>%
+  mutate(busy = pmin(n, c_sim)) # pmin membandingkan n dengan c_sim, ambil yang terkecil
+
+# 2. Buat Plot 1: Jumlah Pelanggan di Sistem (n)
+p1 <- ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(color = "#2980b9", linewidth = 1) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red") +
+  annotate("text", x = 0.5, y = c_sim + 0.2, label = "Kapasitas (c)", color = "red", size = 3) +
+  labs(
+    title = paste("Dinamika Sistem Antrian - Tanggal:", target_tgl),
+    subtitle = "Total Pelanggan dalam Sistem (Menunggu + Dilayani)",
+    y = "Jumlah (n)",
+    x = NULL # Hilangkan label x di plot atas agar tidak duplikat
+  ) +
+  theme_minimal()
+
+# 3. Buat Plot 2: Jumlah Server Sibuk (busy)
+p2 <- ggplot(sim_plot_data, aes(x = time, y = busy)) +
+  geom_step(color = "#27ae60", linewidth = 1) +
+  # Set batas Y agar terlihat jelas batas maksimalnya
+  coord_cartesian(ylim = c(0, c_sim + 0.5)) + 
+  labs(
+    title = "Status Server (Sibuk)",
+    subtitle = paste("Maksimal server sibuk =", c_sim),
+    y = "Server Sibuk",
+    x = "Waktu Simulasi (Jam)"
+  ) +
+  theme_minimal()
+
+# 4. Gabungkan Plot Atas dan Bawah
+grid.arrange(p1, p2, nrow = 2, heights = c(1, 1))
+```
+
+## Tanggal 14-12-2024
+
+```{r}
+### Menjalankan Simulasi
+# 1. Pilih Tanggal Sampel
+sample_case <- valid_data %>%
+  filter(tanggal == "2024-12-14")
+
+target_tgl <- sample_case$tanggal
+lam_sim <- sample_case$lambda_per_jam
+mu_sim <- sample_case$mu_per_jam
+c_sim <- sample_case$c
+
+# 2. Jalankan Simulasi (Durasi T = 10 jam)
+set.seed(123) # Agar hasil reproducible
+sim_result <- simulate_mmc(lambda = lam_sim, mu = mu_sim, c = c_sim, T = 10)
+
+# 3. Visualisasi Step Plot
+ggplot(sim_result, aes(x = time, y = n)) +
+  geom_step(direction = "hv", color = "navy", linewidth = 0.8) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = 0.5, y = c_sim + 0.2, 
+           label = paste("Kapasitas Server (c) =", c_sim), color = "red", hjust = 0) +
+  labs(
+    title = paste("Simulasi Dinamika Antrian Tanggal:", target_tgl),
+    subtitle = sprintf("Parameter: λ=%.2f/jam, μ=%.2f/jam, Server=%d", lam_sim, mu_sim, c_sim),
+    x = "Waktu Simulasi (Jam)",
+    y = "Jumlah Mahasiswa di Sistem (n)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# --- VISUALISASI: Sistem vs Server Sibuk ---
+library(gridExtra) 
+
+# 1. Siapkan Data
+# Kita perlu menambahkan kolom 'busy' ke hasil simulasi
+# Logika: Jumlah server sibuk tidak bisa melebihi kapasitas server (c_sim)
+sim_plot_data <- sim_result %>%
+  mutate(busy = pmin(n, c_sim)) # pmin membandingkan n dengan c_sim, ambil yang terkecil
+
+# 2. Buat Plot 1: Jumlah Pelanggan di Sistem (n)
+p1 <- ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(color = "#2980b9", linewidth = 1) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red") +
+  annotate("text", x = 0.5, y = c_sim + 0.2, label = "Kapasitas (c)", color = "red", size = 3) +
+  labs(
+    title = paste("Dinamika Sistem Antrian - Tanggal:", target_tgl),
+    subtitle = "Total Pelanggan dalam Sistem (Menunggu + Dilayani)",
+    y = "Jumlah (n)",
+    x = NULL # Hilangkan label x di plot atas agar tidak duplikat
+  ) +
+  theme_minimal()
+
+# 3. Buat Plot 2: Jumlah Server Sibuk (busy)
+p2 <- ggplot(sim_plot_data, aes(x = time, y = busy)) +
+  geom_step(color = "#27ae60", linewidth = 1) +
+  # Set batas Y agar terlihat jelas batas maksimalnya
+  coord_cartesian(ylim = c(0, c_sim + 0.5)) + 
+  labs(
+    title = "Status Server (Sibuk)",
+    subtitle = paste("Maksimal server sibuk =", c_sim),
+    y = "Server Sibuk",
+    x = "Waktu Simulasi (Jam)"
+  ) +
+  theme_minimal()
+
+# 4. Gabungkan Plot Atas dan Bawah
+grid.arrange(p1, p2, nrow = 2, heights = c(1, 1))
+```
+
+## Tanggal 15-12-2024
+
+```{r}
+### Menjalankan Simulasi
+# 1. Pilih Tanggal Sampel
+sample_case <- valid_data %>%
+  filter(tanggal == "2024-12-15")
+
+target_tgl <- sample_case$tanggal
+lam_sim <- sample_case$lambda_per_jam
+mu_sim <- sample_case$mu_per_jam
+c_sim <- sample_case$c
+
+# 2. Jalankan Simulasi (Durasi T = 10 jam)
+set.seed(123) # Agar hasil reproducible
+sim_result <- simulate_mmc(lambda = lam_sim, mu = mu_sim, c = c_sim, T = 10)
+
+# 3. Visualisasi Step Plot
+ggplot(sim_result, aes(x = time, y = n)) +
+  geom_step(direction = "hv", color = "navy", linewidth = 0.8) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = 0.5, y = c_sim + 0.2, 
+           label = paste("Kapasitas Server (c) =", c_sim), color = "red", hjust = 0) +
+  labs(
+    title = paste("Simulasi Dinamika Antrian Tanggal:", target_tgl),
+    subtitle = sprintf("Parameter: λ=%.2f/jam, μ=%.2f/jam, Server=%d", lam_sim, mu_sim, c_sim),
+    x = "Waktu Simulasi (Jam)",
+    y = "Jumlah Mahasiswa di Sistem (n)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# --- VISUALISASI: Sistem vs Server Sibuk ---
+library(gridExtra) 
+
+# 1. Siapkan Data
+# Kita perlu menambahkan kolom 'busy' ke hasil simulasi
+# Logika: Jumlah server sibuk tidak bisa melebihi kapasitas server (c_sim)
+sim_plot_data <- sim_result %>%
+  mutate(busy = pmin(n, c_sim)) # pmin membandingkan n dengan c_sim, ambil yang terkecil
+
+# 2. Buat Plot 1: Jumlah Pelanggan di Sistem (n)
+p1 <- ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(color = "#2980b9", linewidth = 1) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red") +
+  annotate("text", x = 0.5, y = c_sim + 0.2, label = "Kapasitas (c)", color = "red", size = 3) +
+  labs(
+    title = paste("Dinamika Sistem Antrian - Tanggal:", target_tgl),
+    subtitle = "Total Pelanggan dalam Sistem (Menunggu + Dilayani)",
+    y = "Jumlah (n)",
+    x = NULL # Hilangkan label x di plot atas agar tidak duplikat
+  ) +
+  theme_minimal()
+
+# 3. Buat Plot 2: Jumlah Server Sibuk (busy)
+p2 <- ggplot(sim_plot_data, aes(x = time, y = busy)) +
+  geom_step(color = "#27ae60", linewidth = 1) +
+  # Set batas Y agar terlihat jelas batas maksimalnya
+  coord_cartesian(ylim = c(0, c_sim + 0.5)) + 
+  labs(
+    title = "Status Server (Sibuk)",
+    subtitle = paste("Maksimal server sibuk =", c_sim),
+    y = "Server Sibuk",
+    x = "Waktu Simulasi (Jam)"
+  ) +
+  theme_minimal()
+
+# 4. Gabungkan Plot Atas dan Bawah
+grid.arrange(p1, p2, nrow = 2, heights = c(1, 1))
+```
+
+## Tanggal 16-12-2024
+
+```{r}
+### Menjalankan Simulasi
+# 1. Pilih Tanggal Sampel
+sample_case <- valid_data %>%
+  filter(tanggal == "2024-12-16")
+
+target_tgl <- sample_case$tanggal
+lam_sim <- sample_case$lambda_per_jam
+mu_sim <- sample_case$mu_per_jam
+c_sim <- sample_case$c
+
+# 2. Jalankan Simulasi (Durasi T = 10 jam)
+set.seed(123) # Agar hasil reproducible
+sim_result <- simulate_mmc(lambda = lam_sim, mu = mu_sim, c = c_sim, T = 10)
+
+# 3. Visualisasi Step Plot
+ggplot(sim_result, aes(x = time, y = n)) +
+  geom_step(direction = "hv", color = "navy", linewidth = 0.8) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = 0.5, y = c_sim + 0.2, 
+           label = paste("Kapasitas Server (c) =", c_sim), color = "red", hjust = 0) +
+  labs(
+    title = paste("Simulasi Dinamika Antrian Tanggal:", target_tgl),
+    subtitle = sprintf("Parameter: λ=%.2f/jam, μ=%.2f/jam, Server=%d", lam_sim, mu_sim, c_sim),
+    x = "Waktu Simulasi (Jam)",
+    y = "Jumlah Mahasiswa di Sistem (n)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# --- VISUALISASI: Sistem vs Server Sibuk ---
+library(gridExtra) 
+
+# 1. Siapkan Data
+# Kita perlu menambahkan kolom 'busy' ke hasil simulasi
+# Logika: Jumlah server sibuk tidak bisa melebihi kapasitas server (c_sim)
+sim_plot_data <- sim_result %>%
+  mutate(busy = pmin(n, c_sim)) # pmin membandingkan n dengan c_sim, ambil yang terkecil
+
+# 2. Buat Plot 1: Jumlah Pelanggan di Sistem (n)
+p1 <- ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(color = "#2980b9", linewidth = 1) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red") +
+  annotate("text", x = 0.5, y = c_sim + 0.2, label = "Kapasitas (c)", color = "red", size = 3) +
+  labs(
+    title = paste("Dinamika Sistem Antrian - Tanggal:", target_tgl),
+    subtitle = "Total Pelanggan dalam Sistem (Menunggu + Dilayani)",
+    y = "Jumlah (n)",
+    x = NULL # Hilangkan label x di plot atas agar tidak duplikat
+  ) +
+  theme_minimal()
+
+# 3. Buat Plot 2: Jumlah Server Sibuk (busy)
+p2 <- ggplot(sim_plot_data, aes(x = time, y = busy)) +
+  geom_step(color = "#27ae60", linewidth = 1) +
+  # Set batas Y agar terlihat jelas batas maksimalnya
+  coord_cartesian(ylim = c(0, c_sim + 0.5)) + 
+  labs(
+    title = "Status Server (Sibuk)",
+    subtitle = paste("Maksimal server sibuk =", c_sim),
+    y = "Server Sibuk",
+    x = "Waktu Simulasi (Jam)"
+  ) +
+  theme_minimal()
+
+# 4. Gabungkan Plot Atas dan Bawah
+grid.arrange(p1, p2, nrow = 2, heights = c(1, 1))
+```
+
+## Tanggal 17-12-2024
+
+```{r}
+### Menjalankan Simulasi
+# 1. Pilih Tanggal Sampel
+sample_case <- valid_data %>%
+  filter(tanggal == "2024-12-17")
+
+target_tgl <- sample_case$tanggal
+lam_sim <- sample_case$lambda_per_jam
+mu_sim <- sample_case$mu_per_jam
+c_sim <- sample_case$c
+
+# 2. Jalankan Simulasi (Durasi T = 10 jam)
+set.seed(123) # Agar hasil reproducible
+sim_result <- simulate_mmc(lambda = lam_sim, mu = mu_sim, c = c_sim, T = 10)
+
+# 3. Visualisasi Step Plot
+ggplot(sim_result, aes(x = time, y = n)) +
+  geom_step(direction = "hv", color = "navy", linewidth = 0.8) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = 0.5, y = c_sim + 0.2, 
+           label = paste("Kapasitas Server (c) =", c_sim), color = "red", hjust = 0) +
+  labs(
+    title = paste("Simulasi Dinamika Antrian Tanggal:", target_tgl),
+    subtitle = sprintf("Parameter: λ=%.2f/jam, μ=%.2f/jam, Server=%d", lam_sim, mu_sim, c_sim),
+    x = "Waktu Simulasi (Jam)",
+    y = "Jumlah Mahasiswa di Sistem (n)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# --- VISUALISASI: Sistem vs Server Sibuk ---
+library(gridExtra) 
+
+# 1. Siapkan Data
+# Kita perlu menambahkan kolom 'busy' ke hasil simulasi
+# Logika: Jumlah server sibuk tidak bisa melebihi kapasitas server (c_sim)
+sim_plot_data <- sim_result %>%
+  mutate(busy = pmin(n, c_sim)) # pmin membandingkan n dengan c_sim, ambil yang terkecil
+
+# 2. Buat Plot 1: Jumlah Pelanggan di Sistem (n)
+p1 <- ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(color = "#2980b9", linewidth = 1) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red") +
+  annotate("text", x = 0.5, y = c_sim + 0.2, label = "Kapasitas (c)", color = "red", size = 3) +
+  labs(
+    title = paste("Dinamika Sistem Antrian - Tanggal:", target_tgl),
+    subtitle = "Total Pelanggan dalam Sistem (Menunggu + Dilayani)",
+    y = "Jumlah (n)",
+    x = NULL # Hilangkan label x di plot atas agar tidak duplikat
+  ) +
+  theme_minimal()
+
+# 3. Buat Plot 2: Jumlah Server Sibuk (busy)
+p2 <- ggplot(sim_plot_data, aes(x = time, y = busy)) +
+  geom_step(color = "#27ae60", linewidth = 1) +
+  # Set batas Y agar terlihat jelas batas maksimalnya
+  coord_cartesian(ylim = c(0, c_sim + 0.5)) + 
+  labs(
+    title = "Status Server (Sibuk)",
+    subtitle = paste("Maksimal server sibuk =", c_sim),
+    y = "Server Sibuk",
+    x = "Waktu Simulasi (Jam)"
+  ) +
+  theme_minimal()
+
+# 4. Gabungkan Plot Atas dan Bawah
+grid.arrange(p1, p2, nrow = 2, heights = c(1, 1))
+```
+
+## Tanggal 18-12-2024
+
+```{r}
+### Menjalankan Simulasi
+# 1. Pilih Tanggal Sampel
+sample_case <- valid_data %>%
+  filter(tanggal == "2024-12-18")
+
+target_tgl <- sample_case$tanggal
+lam_sim <- sample_case$lambda_per_jam
+mu_sim <- sample_case$mu_per_jam
+c_sim <- sample_case$c
+
+# 2. Jalankan Simulasi (Durasi T = 10 jam)
+set.seed(123) # Agar hasil reproducible
+sim_result <- simulate_mmc(lambda = lam_sim, mu = mu_sim, c = c_sim, T = 10)
+
+# 3. Visualisasi Step Plot
+ggplot(sim_result, aes(x = time, y = n)) +
+  geom_step(direction = "hv", color = "navy", linewidth = 0.8) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = 0.5, y = c_sim + 0.2, 
+           label = paste("Kapasitas Server (c) =", c_sim), color = "red", hjust = 0) +
+  labs(
+    title = paste("Simulasi Dinamika Antrian Tanggal:", target_tgl),
+    subtitle = sprintf("Parameter: λ=%.2f/jam, μ=%.2f/jam, Server=%d", lam_sim, mu_sim, c_sim),
+    x = "Waktu Simulasi (Jam)",
+    y = "Jumlah Mahasiswa di Sistem (n)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# --- VISUALISASI: Sistem vs Server Sibuk ---
+library(gridExtra) 
+
+# 1. Siapkan Data
+# Kita perlu menambahkan kolom 'busy' ke hasil simulasi
+# Logika: Jumlah server sibuk tidak bisa melebihi kapasitas server (c_sim)
+sim_plot_data <- sim_result %>%
+  mutate(busy = pmin(n, c_sim)) # pmin membandingkan n dengan c_sim, ambil yang terkecil
+
+# 2. Buat Plot 1: Jumlah Pelanggan di Sistem (n)
+p1 <- ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(color = "#2980b9", linewidth = 1) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red") +
+  annotate("text", x = 0.5, y = c_sim + 0.2, label = "Kapasitas (c)", color = "red", size = 3) +
+  labs(
+    title = paste("Dinamika Sistem Antrian - Tanggal:", target_tgl),
+    subtitle = "Total Pelanggan dalam Sistem (Menunggu + Dilayani)",
+    y = "Jumlah (n)",
+    x = NULL # Hilangkan label x di plot atas agar tidak duplikat
+  ) +
+  theme_minimal()
+
+# 3. Buat Plot 2: Jumlah Server Sibuk (busy)
+p2 <- ggplot(sim_plot_data, aes(x = time, y = busy)) +
+  geom_step(color = "#27ae60", linewidth = 1) +
+  # Set batas Y agar terlihat jelas batas maksimalnya
+  coord_cartesian(ylim = c(0, c_sim + 0.5)) + 
+  labs(
+    title = "Status Server (Sibuk)",
+    subtitle = paste("Maksimal server sibuk =", c_sim),
+    y = "Server Sibuk",
+    x = "Waktu Simulasi (Jam)"
+  ) +
+  theme_minimal()
+
+# 4. Gabungkan Plot Atas dan Bawah
+grid.arrange(p1, p2, nrow = 2, heights = c(1, 1))
+```
+
+## Tanggal 19-12-2024
+
+```{r}
+### Menjalankan Simulasi
+# 1. Pilih Tanggal Sampel
+sample_case <- valid_data %>%
+  filter(tanggal == "2024-12-19")
+
+target_tgl <- sample_case$tanggal
+lam_sim <- sample_case$lambda_per_jam
+mu_sim <- sample_case$mu_per_jam
+c_sim <- sample_case$c
+
+# 2. Jalankan Simulasi (Durasi T = 10 jam)
+set.seed(123) # Agar hasil reproducible
+sim_result <- simulate_mmc(lambda = lam_sim, mu = mu_sim, c = c_sim, T = 10)
+
+# 3. Visualisasi Step Plot
+ggplot(sim_result, aes(x = time, y = n)) +
+  geom_step(direction = "hv", color = "navy", linewidth = 0.8) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = 0.5, y = c_sim + 0.2, 
+           label = paste("Kapasitas Server (c) =", c_sim), color = "red", hjust = 0) +
+  labs(
+    title = paste("Simulasi Dinamika Antrian Tanggal:", target_tgl),
+    subtitle = sprintf("Parameter: λ=%.2f/jam, μ=%.2f/jam, Server=%d", lam_sim, mu_sim, c_sim),
+    x = "Waktu Simulasi (Jam)",
+    y = "Jumlah Mahasiswa di Sistem (n)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# --- VISUALISASI: Sistem vs Server Sibuk ---
+library(gridExtra) 
+
+# 1. Siapkan Data
+# Kita perlu menambahkan kolom 'busy' ke hasil simulasi
+# Logika: Jumlah server sibuk tidak bisa melebihi kapasitas server (c_sim)
+sim_plot_data <- sim_result %>%
+  mutate(busy = pmin(n, c_sim)) # pmin membandingkan n dengan c_sim, ambil yang terkecil
+
+# 2. Buat Plot 1: Jumlah Pelanggan di Sistem (n)
+p1 <- ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(color = "#2980b9", linewidth = 1) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red") +
+  annotate("text", x = 0.5, y = c_sim + 0.2, label = "Kapasitas (c)", color = "red", size = 3) +
+  labs(
+    title = paste("Dinamika Sistem Antrian - Tanggal:", target_tgl),
+    subtitle = "Total Pelanggan dalam Sistem (Menunggu + Dilayani)",
+    y = "Jumlah (n)",
+    x = NULL # Hilangkan label x di plot atas agar tidak duplikat
+  ) +
+  theme_minimal()
+
+# 3. Buat Plot 2: Jumlah Server Sibuk (busy)
+p2 <- ggplot(sim_plot_data, aes(x = time, y = busy)) +
+  geom_step(color = "#27ae60", linewidth = 1) +
+  # Set batas Y agar terlihat jelas batas maksimalnya
+  coord_cartesian(ylim = c(0, c_sim + 0.5)) + 
+  labs(
+    title = "Status Server (Sibuk)",
+    subtitle = paste("Maksimal server sibuk =", c_sim),
+    y = "Server Sibuk",
+    x = "Waktu Simulasi (Jam)"
+  ) +
+  theme_minimal()
+
+# 4. Gabungkan Plot Atas dan Bawah
+grid.arrange(p1, p2, nrow = 2, heights = c(1, 1))
+```
+
+## Tanggal 20-12-2024 (Paling Sibuk)
+
+```{r}
+### Menjalankan Simulasi
+# 1. Pilih Tanggal Sampel
+sample_case <- valid_data %>%
+  filter(tanggal == "2024-12-20")
+
+target_tgl <- sample_case$tanggal
+lam_sim <- sample_case$lambda_per_jam
+mu_sim <- sample_case$mu_per_jam
+c_sim <- sample_case$c
+
+# 2. Jalankan Simulasi (Durasi T = 10 jam)
+set.seed(123) # Agar hasil reproducible
+sim_result <- simulate_mmc(lambda = lam_sim, mu = mu_sim, c = c_sim, T = 10)
+
+# 3. Visualisasi Step Plot
+ggplot(sim_result, aes(x = time, y = n)) +
+  geom_step(direction = "hv", color = "navy", linewidth = 0.8) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = 0.5, y = c_sim + 0.2, 
+           label = paste("Kapasitas Server (c) =", c_sim), color = "red", hjust = 0) +
+  labs(
+    title = paste("Simulasi Dinamika Antrian Tanggal:", target_tgl),
+    subtitle = sprintf("Parameter: λ=%.2f/jam, μ=%.2f/jam, Server=%d", lam_sim, mu_sim, c_sim),
+    x = "Waktu Simulasi (Jam)",
+    y = "Jumlah Mahasiswa di Sistem (n)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# --- VISUALISASI: Sistem vs Server Sibuk ---
+library(gridExtra) 
+
+# 1. Siapkan Data
+# Kita perlu menambahkan kolom 'busy' ke hasil simulasi
+# Logika: Jumlah server sibuk tidak bisa melebihi kapasitas server (c_sim)
+sim_plot_data <- sim_result %>%
+  mutate(busy = pmin(n, c_sim)) # pmin membandingkan n dengan c_sim, ambil yang terkecil
+
+# 2. Buat Plot 1: Jumlah Pelanggan di Sistem (n)
+p1 <- ggplot(sim_plot_data, aes(x = time, y = n)) +
+  geom_step(color = "#2980b9", linewidth = 1) +
+  geom_hline(yintercept = c_sim, linetype = "dashed", color = "red") +
+  annotate("text", x = 0.5, y = c_sim + 0.2, label = "Kapasitas (c)", color = "red", size = 3) +
+  labs(
+    title = paste("Dinamika Sistem Antrian - Tanggal:", target_tgl),
+    subtitle = "Total Pelanggan dalam Sistem (Menunggu + Dilayani)",
+    y = "Jumlah (n)",
+    x = NULL # Hilangkan label x di plot atas agar tidak duplikat
+  ) +
+  theme_minimal()
+
+# 3. Buat Plot 2: Jumlah Server Sibuk (busy)
+p2 <- ggplot(sim_plot_data, aes(x = time, y = busy)) +
+  geom_step(color = "#27ae60", linewidth = 1) +
+  # Set batas Y agar terlihat jelas batas maksimalnya
+  coord_cartesian(ylim = c(0, c_sim + 0.5)) + 
+  labs(
+    title = "Status Server (Sibuk)",
+    subtitle = paste("Maksimal server sibuk =", c_sim),
+    y = "Server Sibuk",
+    x = "Waktu Simulasi (Jam)"
+  ) +
+  theme_minimal()
+
+# 4. Gabungkan Plot Atas dan Bawah
+grid.arrange(p1, p2, nrow = 2, heights = c(1, 1))
+```
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
