@@ -101,7 +101,7 @@ Model M/M/c:
 - λ > 0
 - ρ < 1
 
-**Terdapat 15 hari yang valid.**
+**Terdapat 16 hari yang valid.**
 
 ### Analisis Performa Sistem
 
